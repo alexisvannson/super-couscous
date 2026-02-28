@@ -26,14 +26,14 @@ class CNN(nn.Module):
             layers.append(ConvolutionBlock(current_in_dim, layer_out, kernel_size, stride, padding))
             current_in_dim = layer_out
         self.convolutional_layers = nn.Sequential(*layers)
-
+        self.flatten = nn.Flatten()
         # Compute flattened size dynamically by passing a dummy input through the conv layers
         with torch.no_grad():
             dummy = torch.zeros(1, in_dim, *input_image_size)
             out = self.convolutional_layers(dummy)
-            flattened_size = out.view(1, -1).shape[1]
+            flattened_size = self.flatten(out).shape[1]
 
-        self.flatten = nn.Flatten()
+        
         self.fc = nn.Linear(flattened_size, out_dim)
 
     def forward(self, x):
