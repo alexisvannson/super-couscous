@@ -1,1 +1,8 @@
-datasets
+torch
+torchvision
+scikit-learn
+Pillow
+pandas
+tqdm
+pyyaml
+numpy<2
