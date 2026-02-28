@@ -1,0 +1,9 @@
+model_params:
+  nblocks: 3
+  in_dim: 3
+  out_dim: 10
+  kernel_size: 3
+  stride: 1
+  padding: 1
+  layers_out: [32, 64, 128]
+  input_image_size: [224, 224]
