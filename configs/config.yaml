@@ -1,0 +1,34 @@
+data:
+  labels_csv: "data/sample_labels.csv"
+  image_dir: "data/sample/images"
+dataloader:
+  batch_size: 32
+  val_split: 0.2
+  test_split: 0.1
+  seed: 42
+  num_workers: 0
+
+transform:
+  image_size: 224
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std: [0.229, 0.224, 0.225]
+
+model_registry:
+  senet:
+    module_path: "models.SENET"
+    class_name: "SENet"
+  vit:
+    module_path: "models.VIT"
+    class_name: "VisionTransformerPretrained" # Pre-trained ViT from HuggingFace
+  vit-scratch:
+    module_path: "models.VIT"
+    class_name: "VisionTransformer" # Custom ViT from scratch
+  mlp:
+    module_path: "models.MLP"
+    class_name: "MLP"
+  cnn:
+    module_path: "models.CNN"
+    class_name: "CNN"
+  resnet:
+    module_path: "models.ResNet"
+    class_name: "ResNet"
