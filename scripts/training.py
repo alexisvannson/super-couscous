@@ -12,11 +12,10 @@ from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
-# Add project root to path
+
 # Add the project root directory to the Python module search path to enable imports from sibling directories.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# Model Registry: Maps model names to (module_path, class_name)
 
 
 def get_registered_models(config=None):
@@ -35,27 +34,32 @@ def get_registered_models(config=None):
         return list(config["model_registry"].keys())
 
 def load_config(model_name):
-    """Load configuration for a specific model."""
-    config_path = os.path.join("config", f"{model_name.lower()}.yaml")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+    """Load base config, optionally merged with model-specific config."""
+    base_path = os.path.join("configs", "config.yaml")
+    if not os.path.exists(base_path):
+        raise FileNotFoundError(f"Config file not found: {base_path}")
+    with open(base_path, "r") as f:
+        config = yaml.safe_load(f) or {}
 
-    with open(config_path, "r") as f:
-        configs = yaml.safe_load(f)
-    return configs
+    model_path = os.path.join("configs", f"{model_name.lower()}.yaml")
+    if os.path.exists(model_path):
+        with open(model_path, "r") as f:
+            model_config = yaml.safe_load(f) or {}
+        config.update(model_config)
+
+    return config
 
 
 def create_model(model_name, config):
-    MODEL_REGISTRY = get_registered_models(config)
     """Create model instance based on name and config using registry."""
+    registry = config.get("model_registry", {})
     model_key = model_name.lower()
 
-    if model_key not in MODEL_REGISTRY:
-        available_models = ", ".join(get_registered_models())
-        raise ValueError(f"Unknown model: {model_name}. " f"Available models: {available_models}")
+    if model_key not in registry:
+        raise ValueError(f"Unknown model: {model_name}. Available models: {', '.join(registry)}")
 
-    # Get module and class name from registry
-    module_path, class_name = MODEL_REGISTRY[model_key]
+    entry = registry[model_key]
+    module_path, class_name = entry["module_path"], entry["class_name"]
 
     # Dynamically import the model class
     module = __import__(module_path, fromlist=[class_name])
@@ -254,145 +258,97 @@ def train(
 
 
 
+def resolve_path(paths, default, writable=False):
+    """Return the first valid path from a list, or the string as-is."""
+    if not isinstance(paths, list):
+        return paths
+    for path in paths:
+        check = os.path.dirname(path) if writable and os.path.dirname(path) else path
+        if os.path.exists(check) and (not writable or os.access(check, os.W_OK)):
+            subdirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))] if not writable and os.path.isdir(path) else [True]
+            if subdirs:
+                print(f"Using path: {path}")
+                return path
+    print(f"Warning: no valid path found, using: {paths[0]}")
+    return paths[0]
+
+
+def setup_dataloaders(config, transform):
+    """Build train and optional validation DataLoaders from config."""
+    data_config = config.get("data", {})
+    root_path = resolve_path(data_config.get("root", "data/Dataset"), "data/Dataset")
+    full_dataset = datasets.ImageFolder(root=root_path, transform=transform)
+
+    batch_size = data_config.get("batch_size", 32)
+    val_split = data_config.get("val_split", 0.2)
+
+    if val_split > 0:
+        val_size = int(len(full_dataset) * val_split)
+        train_size = len(full_dataset) - val_size
+        generator = torch.Generator().manual_seed(42)
+        trainset, valset = random_split(full_dataset, [train_size, val_size], generator=generator)
+        print(f"Dataset split: {train_size} training, {val_size} validation samples")
+        valloader = DataLoader(valset, batch_size=batch_size, shuffle=False)
+    else:
+        trainset = full_dataset
+        valloader = None
+        print(f"No validation split. Using all {len(trainset)} samples for training.")
+
+    trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=data_config.get("shuffle", True))
+    return trainloader, valloader
+
+
+def setup_optimizer(model, train_config):
+    """Create optimizer from config."""
+    optimizer_type = train_config.get("optimizer", "Adam")
+    lr = train_config.get("learning_rate", 0.001)
+    weight_decay = train_config.get("weight_decay", 0.0)
+
+    if optimizer_type == "Adam":
+        return optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif optimizer_type == "AdamW":
+        return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif optimizer_type == "SGD":
+        return optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay,
+                         momentum=train_config.get("momentum", 0.9), nesterov=True)
+    raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train model script")
-    parser.add_argument("--model", type=str, required=True, help="Model name to train")
-    parser.add_argument(
-        "--config", type=str, default=None, help="Override default config file path"
-    )
-    parser.add_argument(
-        "--weights", type=str, default=None, help="Path to pretrained weights for fine-tuning"
-    )
+    parser.add_argument("model", type=str, help="Model name to train")
+    parser.add_argument("--config", type=str, default=None, help="Override default config file path")
+    parser.add_argument("--weights", type=str, default=None, help="Path to pretrained weights for fine-tuning")
     args = parser.parse_args()
 
-    model_name = args.model
-
-    # Load configuration
     if args.config:
         with open(args.config, "r") as f:
             config = yaml.safe_load(f)
     else:
-        config = load_config(model_name)
+        config = load_config(args.model)
 
-    # Create model
-    model = create_model(model_name, config)
+    model = create_model(args.model, config)
+    trainloader, valloader = setup_dataloaders(config, get_transforms(config.get("transforms", {})))
 
-    # Setup transforms
-    transform = get_transforms(config.get("transforms", {}))
-
-    data_config = config.get("data", {})
-    root_path = data_config.get("root", "data/Dataset")
-
-    # Handle case where root is a list (for Colab/local compatibility)
-    if isinstance(root_path, list):
-        # Try to find the first path that exists and contains subdirectories (class folders)
-        for path in root_path:
-            if os.path.exists(path) and os.path.isdir(path):
-                # Check if directory has subdirectories (required for ImageFolder)
-                subdirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
-                if subdirs:
-                    root_path = path
-                    print(f"Using dataset path: {path}")
-                    break
-        else:
-            # If none exist with subdirs, use the first one
-            root_path = root_path[0]
-            print(f"Warning: No valid dataset path found. Using: {root_path}")
-
-    # Load full dataset
-    full_dataset = datasets.ImageFolder(
-        root=root_path, transform=transform
-    )
-
-    # Split dataset into train and validation sets
-    val_split = data_config.get("val_split", 0.2)  # Default to 20% validation
-    if val_split > 0:
-        val_size = int(len(full_dataset) * val_split)
-        train_size = len(full_dataset) - val_size
-
-        # Use a fixed seed for reproducibility
-        generator = torch.Generator().manual_seed(42)
-        trainset, valset = random_split(full_dataset, [train_size, val_size], generator=generator)
-
-        print(f"Dataset split: {train_size} training samples, {val_size} validation samples")
-
-        # Create dataloaders
-        trainloader = DataLoader(
-            trainset,
-            batch_size=data_config.get("batch_size", 32),
-            shuffle=data_config.get("shuffle", True),
-        )
-
-        valloader = DataLoader(
-            valset,
-            batch_size=data_config.get("batch_size", 32),
-            shuffle=False,
-        )
-    else:
-        # No validation split - use entire dataset for training
-        trainset = full_dataset
-        trainloader = DataLoader(
-            trainset,
-            batch_size=data_config.get("batch_size", 32),
-            shuffle=data_config.get("shuffle", True),
-        )
-        valloader = None
-        print(f"No validation split. Using all {len(trainset)} samples for training.")
-
-    # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     print(f"Using device: {device}")
 
-    # Setup training components
     train_config = config.get("training", {})
-    criterion = nn.CrossEntropyLoss()
+    output_path = resolve_path(
+        train_config.get("output_paths", train_config.get("output_path", "models/checkpoints")),
+        "models/checkpoints", writable=True
+    )
 
-    # Create optimizer based on type
-    optimizer_type = train_config.get("optimizer", "Adam")
-    lr = train_config.get("learning_rate", 0.001)
-    weight_decay = train_config.get("weight_decay", 0.0)
-    momentum = train_config.get("momentum", 0.9)
-
-    if optimizer_type == "Adam":
-        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    elif optimizer_type == "AdamW":
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    elif optimizer_type == "SGD":
-        optimizer = optim.SGD(
-            model.parameters(), lr=lr, weight_decay=weight_decay,
-            momentum=momentum, nesterov=True
-        )
-    else:
-        raise ValueError(f"Unknown optimizer: {optimizer_type}")
-
-    # Handle output_path list (for Colab/local compatibility)
-    output_path = train_config.get("output_paths", train_config.get("output_path", "models/checkpoints"))
-    if isinstance(output_path, list):
-        # Try to find first writable path (e.g., Google Drive might be mounted)
-        for path in output_path:
-            parent = os.path.dirname(path) if os.path.dirname(path) else "."
-            if os.path.exists(parent) and os.access(parent, os.W_OK):
-                output_path = path
-                print(f"Using output path: {path}")
-                break
-        else:
-            # Use first path and let os.makedirs create it
-            output_path = output_path[0]
-            print(f"Using output path: {output_path}")
-
-    # Train model
     train(
         model=model,
         train_loader=trainloader,
         val_loader=valloader,
-        criterion=criterion,
-        optimizer=optimizer,
+        criterion=nn.CrossEntropyLoss(),
+        optimizer=setup_optimizer(model, train_config),
         device=device,
         output_path=output_path,
-        weights_name=model_name,
+        weights_name=args.model,
         epochs=train_config.get("epochs", 20),
         patience=train_config.get("patience", 5),
         start_weights=args.weights,
