@@ -3,7 +3,7 @@ import torch
 
 class ConvolutionBlock(nn.Module):
     def __init__(self, in_dim, out_dim, kernel_size, stride=1, padding=0):
-        super(ConvolutionBlock).__init__(self)
+        super(ConvolutionBlock, self).__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.relu = nn.ReLU()
