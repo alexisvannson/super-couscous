@@ -1,7 +1,21 @@
-import re
+"""
+Implementation of DenseNet-121 following the paper "Densely Connected Convolutional Networks" (Huang et al., CVPR 2017) and torchvision's implementation (to load pretrained weights).
+
+The model is a densely connected network for multi-label classification.
+
+The model is based on the following architecture:
+
+- Stem: 224×224 → 56×56  (names match torchvision: conv0, norm0, relu0, pool0)
+- Dense Blocks: 6, 12, 24, 16
+- Transition Layers: 3
+- Final BN (name matches torchvision: norm5)
+- Classifier: 1024 → num_classes
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import OrderedDict
 
 
 class DenseLayer(nn.Module):
@@ -18,24 +32,24 @@ class DenseLayer(nn.Module):
         super(DenseLayer, self).__init__()
         bottleneck_channels = 4 * growth_rate
 
-        self.bn1   = nn.BatchNorm2d(in_channels)
+        self.norm1 = nn.BatchNorm2d(in_channels)
         self.conv1 = nn.Conv2d(in_channels, bottleneck_channels, kernel_size=1, bias=False)
 
-        self.bn2   = nn.BatchNorm2d(bottleneck_channels)
+        self.norm2 = nn.BatchNorm2d(bottleneck_channels)
         self.conv2 = nn.Conv2d(bottleneck_channels, growth_rate,
                                kernel_size=3, padding=1, bias=False)
 
         self.drop_rate = drop_rate
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.conv1(F.relu(self.bn1(x), inplace=True))
-        out = self.conv2(F.relu(self.bn2(out), inplace=True))
+        out = self.conv1(F.relu(self.norm1(x), inplace=True))
+        out = self.conv2(F.relu(self.norm2(out), inplace=True))
         if self.drop_rate > 0.0:
             out = F.dropout(out, p=self.drop_rate, training=self.training)
         return out  # shape: (B, growth_rate, H, W) — new channels only
 
 
-class DenseBlock(nn.Module):
+class DenseBlock(nn.ModuleDict):
     """
     Dense Block: each layer receives the concatenation of all preceding layer outputs.
 
@@ -51,14 +65,13 @@ class DenseBlock(nn.Module):
     def __init__(self, num_layers: int, in_channels: int,
                  growth_rate: int = 32, drop_rate: float = 0.0):
         super(DenseBlock, self).__init__()
-        self.layers = nn.ModuleList([
-            DenseLayer(in_channels + i * growth_rate, growth_rate, drop_rate)
-            for i in range(num_layers)
-        ])
+        for i in range(num_layers):
+            layer = DenseLayer(in_channels + i * growth_rate, growth_rate, drop_rate)
+            self.add_module(f'denselayer{i + 1}', layer)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feature_maps = [x]
-        for layer in self.layers:
+        for layer in self.values():
             new_features = layer(torch.cat(feature_maps, dim=1))
             feature_maps.append(new_features)
         return torch.cat(feature_maps, dim=1)
@@ -78,12 +91,12 @@ class TransitionLayer(nn.Module):
     def __init__(self, in_channels: int, compression: float = 0.5):
         super(TransitionLayer, self).__init__()
         out_channels = int(in_channels * compression)
-        self.bn   = nn.BatchNorm2d(in_channels)
+        self.norm = nn.BatchNorm2d(in_channels)
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
         self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(F.relu(self.bn(x), inplace=True))
+        x = self.conv(F.relu(self.norm(x), inplace=True))
         return self.pool(x)
 
 
@@ -93,7 +106,7 @@ class DenseNet121(nn.Module):
 
     Tensor shapes through the network (B = batch, k = 32):
         input              (B,    3, 224, 224)
-        after stem         (B,   64,  56,  56)
+        after stem         (B,   64,  56,  56)   conv0/norm0/relu0/pool0
         after block 1      (B,  256,  56,  56)   64  + 6×32
         after transition 1 (B,  128,  28,  28)   256×0.5, pool÷2
         after block 2      (B,  512,  28,  28)   128 + 12×32
@@ -128,34 +141,66 @@ class DenseNet121(nn.Module):
 
         initial_channels = 2 * growth_rate  # 64 for k=32
 
-        # Stem: 224×224 → 56×56
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, initial_channels,
-                      kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(initial_channels),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-        )
+        # Stem: 224×224 → 56×56  (names match torchvision: conv0, norm0, relu0, pool0)
+        self.features = nn.Sequential(OrderedDict([
+            ('conv0', nn.Conv2d(in_channels, initial_channels,
+                                kernel_size=7, stride=2, padding=3, bias=False)),
+            ('norm0', nn.BatchNorm2d(initial_channels)),
+            ('relu0', nn.ReLU(inplace=True)),
+            ('pool0', nn.MaxPool2d(kernel_size=3, stride=2, padding=1)),
+        ]))
 
         current_channels = initial_channels
-        self.dense_blocks = nn.ModuleList()
-        self.transitions  = nn.ModuleList()
 
         for i, num_layers in enumerate(block_config):
-            self.dense_blocks.append(
-                DenseBlock(num_layers, current_channels, growth_rate, drop_rate)
-            )
+            block = DenseBlock(num_layers, current_channels, growth_rate, drop_rate)
+            self.features.add_module(f'denseblock{i + 1}', block)
             current_channels += num_layers * growth_rate
 
             if i < len(block_config) - 1:
-                self.transitions.append(TransitionLayer(current_channels, compression))
+                trans = TransitionLayer(current_channels, compression)
+                self.features.add_module(f'transition{i + 1}', trans)
                 current_channels = int(current_channels * compression)
 
-        self.final_bn   = nn.BatchNorm2d(current_channels)
+        # Final BN (name matches torchvision: norm5)
+        self.features.add_module('norm5', nn.BatchNorm2d(current_channels))
+
         self.classifier = nn.Linear(current_channels, num_classes)
         self.out_channels = current_channels  # 1024 for standard DenseNet-121
 
         self._init_weights()
+
+    def load_imagenet_weights(self, strict_backbone: bool = True):
+        """
+        Load ImageNet-pretrained weights from torchvision's DenseNet-121 into this model.
+        The classifier head is always skipped (different num_classes).
+
+        Module names in this model mirror torchvision's DenseNet-121, so backbone
+        weights are loaded directly without key remapping:
+            features.conv0                             (stem conv)
+            features.norm0                             (stem BN)
+            features.denseblock{i}.denselayer{j}.norm1
+            features.denseblock{i}.denselayer{j}.conv1
+            features.denseblock{i}.denselayer{j}.norm2
+            features.denseblock{i}.denselayer{j}.conv2
+            features.transition{i}.norm
+            features.transition{i}.conv
+            features.norm5                             (final BN)
+        """
+        from torchvision.models import densenet121, DenseNet121_Weights
+        pretrained_sd = densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1).state_dict()
+        backbone_sd = {k: v for k, v in pretrained_sd.items() if not k.startswith('classifier')}
+        missing, unexpected = self.load_state_dict(backbone_sd, strict=False)
+
+        backbone_missing = [k for k in missing if not k.startswith('classifier')]
+        if strict_backbone and backbone_missing:
+            raise RuntimeError(f"Failed to load backbone weights: {backbone_missing}")
+
+        print("Pretrained ImageNet weights loaded. Classifier head re-initialised from scratch.")
+        if backbone_missing:
+            print(f"  Missing  : {backbone_missing}")
+        if unexpected:
+            print(f"  Unexpected: {unexpected}")
 
     def _init_weights(self):
         for m in self.modules():
@@ -170,13 +215,7 @@ class DenseNet121(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-
-        for i, block in enumerate(self.dense_blocks):
-            x = block(x)
-            if i < len(self.transitions):
-                x = self.transitions[i](x)
-
-        x = F.relu(self.final_bn(x), inplace=True)
+        x = self.features(x)
+        x = F.relu(x, inplace=True)
         x = F.adaptive_avg_pool2d(x, output_size=1).flatten(start_dim=1)
         return self.classifier(x)
