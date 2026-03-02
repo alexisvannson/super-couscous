@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import yaml
-from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -20,35 +19,19 @@ from scripts.thedataloader import get_dataloaders
 from scripts.losses import build_loss
 
 
-
-def get_registered_models(config=None):
-    """
-    Get list of model names from registry in config file.
-
-    Args:
-        config (dict, optional): Configuration dictionary that may contain a model registry
-                                 under config["model_registry"] as a dict
-                                 mapping model names to (module_path, class_name).
-
-    Returns:
-        list: Registered model names.
-    """
-    if config is not None and "model_registry" in config:
-        return list(config["model_registry"].keys())
-
 def load_config(model_name):
     """Load base config, optionally merged with model-specific config."""
     base_path = os.path.join("configs", "config.yaml")
-    if not os.path.exists(base_path):
+    try:
+        with open(base_path) as f:
+            config = yaml.safe_load(f) or {}
+    except FileNotFoundError:
         raise FileNotFoundError(f"Config file not found: {base_path}")
-    with open(base_path, "r") as f:
-        config = yaml.safe_load(f) or {}
 
     model_path = os.path.join("configs", f"{model_name.lower()}.yaml")
     if os.path.exists(model_path):
-        with open(model_path, "r") as f:
-            model_config = yaml.safe_load(f) or {}
-        config.update(model_config)
+        with open(model_path) as f:
+            config.update(yaml.safe_load(f) or {})
 
     return config
 
@@ -64,27 +47,21 @@ def create_model(model_name, config):
     entry = registry[model_key]
     module_path, class_name = entry["module_path"], entry["class_name"]
 
-    # Dynamically import the model class
     module = __import__(module_path, fromlist=[class_name])
     ModelClass = getattr(module, class_name)
 
-    # Instantiate model with config parameters
-    model = ModelClass(**config["model_params"])
-
-    return model
+    return ModelClass(**config["model_params"])
 
 
 def get_transforms(config):
     """Create transforms based on config."""
     transform_list = []
 
-    # Resize if specified
     if "image_size" in config:
         transform_list.append(transforms.Resize((config["image_size"], config["image_size"])))
 
     transform_list.append(transforms.ToTensor())
 
-    # Normalize if specified
     if "normalize" in config and config["normalize"]:
         transform_list.append(
             transforms.Normalize(
@@ -96,7 +73,6 @@ def get_transforms(config):
     return transforms.Compose(transform_list)
 
 
-    
 def validate(model, val_loader, criterion, device, threshold=0.5):
     """
     Validate the model on validation set.
@@ -135,8 +111,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5):
     tp = (preds_cat * targets_cat).sum(dim=0)
     fp = (preds_cat * (1 - targets_cat)).sum(dim=0)
     fn = ((1 - preds_cat) * targets_cat).sum(dim=0)
-    f1_per_label = (2 * tp / (2 * tp + fp + fn + 1e-8))
-    macro_f1 = f1_per_label.mean().item() * 100
+    macro_f1 = (2 * tp / (2 * tp + fp + fn + 1e-8)).mean().item() * 100
 
     return avg_loss, exact_match, macro_f1
 
@@ -150,6 +125,7 @@ def train(
     epochs,
     val_loader=None,
     patience=5,
+    scheduler=None,
     output_path="weights",
     weights_name="final_model",
     start_weights=None,
@@ -160,32 +136,27 @@ def train(
     if start_weights:
         model.load_state_dict(torch.load(start_weights, map_location=device))
 
-    # Create the full output path directory structure
     os.makedirs(output_path, exist_ok=True)
     print(f"Training model in {output_path}")
 
-    # Create a timestamped log file for this training run
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(output_path, f"training_logs_{timestamp}.txt")
+    start_time = datetime.now()
+    log_path = os.path.join(output_path, f"training_logs_{start_time.strftime('%Y%m%d_%H%M%S')}.txt")
 
-    # Write training start info
-    with open(log_path, "w") as the_file:
-        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        the_file.write(f"Training started at: {timestamp_str}\n")
-        the_file.write(f"Epochs: {epochs}, Patience: {patience}\n")
-        the_file.write(f"Output path: {output_path}\n")
-        the_file.write(f"Device: {device}\n")
-        the_file.write("-" * 50 + "\n")
+    with open(log_path, "w") as f:
+        f.write(f"Training started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Epochs: {epochs}, Patience: {patience}\n")
+        f.write(f"Output path: {output_path}\n")
+        f.write(f"Device: {device}\n")
+        f.write("-" * 50 + "\n")
 
-    print('start training')
+    print("start training")
 
     for epoch in range(epochs):
-        checkpoint1 = time.time()
-        epoch_loss = 0
-        num_batches = 0
+        t0 = time.time()
+        epoch_loss = 0.0
         model.train()
+
         for sample, label in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
-            # Move data to device
             sample = sample.to(device)
             label = label.to(device)
 
@@ -197,87 +168,60 @@ def train(
             optimizer.step()
 
             epoch_loss += loss.item()
-            num_batches += 1
 
-        avg_train_loss = epoch_loss / max(1, num_batches)
-        checkpoint2 = time.time()
-        epoch_time = checkpoint2 - checkpoint1
+        avg_train_loss = epoch_loss / len(train_loader)
+        epoch_time = time.time() - t0
 
-        # Run validation if val_loader is provided
         if val_loader is not None:
             val_loss, exact_match, macro_f1 = validate(model, val_loader, criterion, device)
-            print(f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f}, exact_match={exact_match:.2f}%, macro_f1={macro_f1:.2f}%")
-
-            # Save training logs with validation metrics
-            with open(log_path, "a") as the_file:
-                the_file.write(f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f}, exact_match={exact_match:.2f}%, macro_f1={macro_f1:.2f}%\n")
-                time_mins = epoch_time / 60
-                the_file.write(f"Epoch {epoch+1}/{epochs}, needed {time_mins:.2f} minutes\n")
-
-            # Early stopping based on validation loss
-            if val_loss < best_loss:
-                best_loss = val_loss
-                patience_counter = 0
-                # Save best model in the same directory as final model
-                best_model_path = os.path.join(output_path, f"best_model_epoch{epoch+1}.pth")
-                torch.save(model.state_dict(), best_model_path)
-                print(f"Saved best model with val_loss={val_loss:.4f}: {best_model_path}")
-            else:
-                patience_counter += 1
+            if scheduler is not None:
+                scheduler.step(val_loss)
+            monitor_loss = val_loss
+            log_line = (f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f},"
+                        f" val_loss={val_loss:.4f}, exact_match={exact_match:.2f}%, macro_f1={macro_f1:.2f}%")
         else:
-            # No validation set - use training loss for early stopping
-            print(f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f}")
+            monitor_loss = avg_train_loss
+            log_line = f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f}"
 
-            # Save training logs without validation metrics
-            with open(log_path, "a") as the_file:
-                the_file.write(f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f}\n")
-                time_mins = epoch_time / 60
-                the_file.write(f"Epoch {epoch+1}/{epochs}, needed {time_mins:.2f} minutes\n")
+        print(log_line)
+        with open(log_path, "a") as f:
+            f.write(log_line + "\n")
+            f.write(f"Epoch {epoch+1}/{epochs}, needed {epoch_time / 60:.2f} minutes\n")
 
-            # Early stopping based on training loss
-            if avg_train_loss < best_loss:
-                best_loss = avg_train_loss
-                patience_counter = 0
-                # Save best model in the same directory as final model
-                best_model_path = os.path.join(output_path, f"best_model_epoch{epoch+1}.pth")
-                torch.save(model.state_dict(), best_model_path)
-                print(f"Saved best model with train_loss={avg_train_loss:.4f}: {best_model_path}")
-            else:
-                patience_counter += 1
+        if monitor_loss < best_loss:
+            best_loss = monitor_loss
+            patience_counter = 0
+            best_model_path = os.path.join(output_path, f"best_model_epoch{epoch+1}.pth")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"Saved best model (loss={monitor_loss:.4f}): {best_model_path}")
+        else:
+            patience_counter += 1
 
-        print(f"Epoch {epoch + 1} took {epoch_time:.2f} seconds")
+        print(f"Epoch {epoch+1} took {epoch_time:.2f} seconds")
 
         if patience_counter >= patience:
             print(f"Early stopping at epoch {epoch+1}")
             break
 
-    # Save final model in the same directory as best models
     final_model_path = os.path.join(output_path, f"{weights_name}.pth")
     torch.save(model.state_dict(), final_model_path)
     print(f"Saved final model: {final_model_path}")
 
-    # Write training completion info to log
-    with open(log_path, "a") as the_file:
-        the_file.write("-" * 50 + "\n")
-        completion_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        the_file.write(f"Training completed at: {completion_time}\n")
-        the_file.write(f"Best loss achieved: {best_loss:.4f}\n")
-        the_file.write(f"Final model saved: {final_model_path}\n")
+    with open(log_path, "a") as f:
+        f.write("-" * 50 + "\n")
+        f.write(f"Training completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Best loss achieved: {best_loss:.4f}\n")
+        f.write(f"Final model saved: {final_model_path}\n")
 
 
-
-def resolve_path(paths, default, writable=False):
+def resolve_path(paths, writable=False):
     """Return the first valid path from a list, or the string as-is."""
     if not isinstance(paths, list):
         return paths
     for path in paths:
         check = os.path.dirname(path) if writable and os.path.dirname(path) else path
         if os.path.exists(check) and (not writable or os.access(check, os.W_OK)):
-            subdirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))] if not writable and os.path.isdir(path) else [True]
-            if subdirs:
-                print(f"Using path: {path}")
-                return path
-    print(f"Warning: no valid path found, using: {paths[0]}")
+            return path
     return paths[0]
 
 
@@ -315,6 +259,23 @@ def setup_optimizer(model, train_config):
     raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
 
+def setup_scheduler(optimizer, train_config):
+    """Create LR scheduler from config, or return None if not configured."""
+    sched_config = train_config.get("scheduler")
+    if not sched_config:
+        return None
+    name = sched_config.get("name", "ReduceLROnPlateau")
+    if name == "ReduceLROnPlateau":
+        return optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=sched_config.get("factor", 0.1),
+            patience=sched_config.get("patience", 1),
+            min_lr=sched_config.get("min_lr", 1e-6),
+        )
+    raise ValueError(f"Unknown scheduler: {name}")
+
+
 def setup_criterion(config: dict, train_loader=None) -> nn.Module:
     """Instantiate loss function from config. Falls back to AsymmetricLoss if not specified."""
     loss_config = config.get("loss", {"name": "asymmetric"})
@@ -329,7 +290,7 @@ def main():
     args = parser.parse_args()
 
     if args.config:
-        with open(args.config, "r") as f:
+        with open(args.config) as f:
             config = yaml.safe_load(f)
     else:
         config = load_config(args.model)
@@ -342,17 +303,17 @@ def main():
     print(f"Using device: {device}")
 
     train_config = config.get("training", {})
-    output_path = resolve_path(
-        train_config.get("output_paths", train_config.get("output_path", "models/checkpoints")),
-        "models/checkpoints", writable=True
-    )
+    out_path_cfg = train_config.get("output_paths") or train_config.get("output_path", "models/checkpoints")
+    output_path = resolve_path(out_path_cfg, writable=True)
 
+    optimizer = setup_optimizer(model, train_config)
     train(
         model=model,
         train_loader=trainloader,
         val_loader=valloader,
         criterion=setup_criterion(config, train_loader=trainloader),
-        optimizer=setup_optimizer(model, train_config),
+        optimizer=optimizer,
+        scheduler=setup_scheduler(optimizer, train_config),
         device=device,
         output_path=output_path,
         weights_name=args.model,
