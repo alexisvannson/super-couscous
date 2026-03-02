@@ -78,8 +78,8 @@ def split_data(full_dataset, seed, val_split, test_split):
     return train_indices, val_indices, test_indices
 
 
-def get_dataloaders(data_path, label_path, batch_size=32, val_split=0.2, test_split=0.1, seed=42, num_workers=0):
-    full_dataset = ChestXrayDataset(label_path, data_path)
+def get_dataloaders(data_path, label_path, batch_size=32, val_split=0.2, test_split=0.1, seed=42, num_workers=0, transform=None):
+    full_dataset = ChestXrayDataset(label_path, data_path, transform=transform)
 
     train_indices, val_indices, test_indices = split_data(full_dataset, seed, val_split, test_split)
 
