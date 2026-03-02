@@ -8,13 +8,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import yaml
-from torch.utils.data import DataLoader, random_split
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from torchvision import transforms
 from tqdm import tqdm
 
 
 # Add the project root directory to the Python module search path to enable imports from sibling directories.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from scripts.thedataloader import get_dataloaders
+from scripts.losses import build_loss
 
 
 
@@ -76,8 +79,8 @@ def get_transforms(config):
     transform_list = []
 
     # Resize if specified
-    if "img_size" in config:
-        transform_list.append(transforms.Resize((config["img_size"], config["img_size"])))
+    if "image_size" in config:
+        transform_list.append(transforms.Resize((config["image_size"], config["image_size"])))
 
     transform_list.append(transforms.ToTensor())
 
@@ -94,43 +97,48 @@ def get_transforms(config):
 
 
     
-def validate(model, val_loader, criterion, device):
+def validate(model, val_loader, criterion, device, threshold=0.5):
     """
     Validate the model on validation set.
 
-    Args:
-        model: The model to validate
-        val_loader: Validation data loader
-        criterion: Loss function
-        device: Device to run validation on
-
     Returns:
-        tuple: (average_loss, accuracy)
+        tuple: (avg_loss, exact_match_accuracy, macro_f1)
+            - exact_match_accuracy: % of samples where ALL labels are correct
+            - macro_f1: average F1 across all labels
     """
     model.eval()
     val_loss = 0
-    correct = 0
-    total = 0
+    all_preds = []
+    all_targets = []
 
     with torch.no_grad():
         for sample, label in val_loader:
             sample = sample.to(device)
-            label = label.to(device)
+            label = label.to(device).float()
 
             logits = model(sample)
-            loss = criterion(logits, label)
+            val_loss += criterion(logits, label).item()
 
-            val_loss += loss.item()
-
-            # Calculate accuracy
-            _, predicted = torch.max(logits.data, 1)
-            total += label.size(0)
-            correct += (predicted == label).sum().item()
+            preds = (torch.sigmoid(logits) >= threshold).float()
+            all_preds.append(preds.cpu())
+            all_targets.append(label.cpu())
 
     avg_loss = val_loss / len(val_loader)
-    accuracy = 100 * correct / total if total > 0 else 0
 
-    return avg_loss, accuracy
+    preds_cat = torch.cat(all_preds)     # (N, C)
+    targets_cat = torch.cat(all_targets) # (N, C)
+
+    # Exact match accuracy (all labels must match)
+    exact_match = (preds_cat == targets_cat).all(dim=1).float().mean().item() * 100
+
+    # Macro F1 across labels
+    tp = (preds_cat * targets_cat).sum(dim=0)
+    fp = (preds_cat * (1 - targets_cat)).sum(dim=0)
+    fn = ((1 - preds_cat) * targets_cat).sum(dim=0)
+    f1_per_label = (2 * tp / (2 * tp + fp + fn + 1e-8))
+    macro_f1 = f1_per_label.mean().item() * 100
+
+    return avg_loss, exact_match, macro_f1
 
 
 def train(
@@ -197,12 +205,12 @@ def train(
 
         # Run validation if val_loader is provided
         if val_loader is not None:
-            val_loss, val_accuracy = validate(model, val_loader, criterion, device)
-            print(f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f}, val_acc={val_accuracy:.2f}%")
+            val_loss, exact_match, macro_f1 = validate(model, val_loader, criterion, device)
+            print(f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f}, exact_match={exact_match:.2f}%, macro_f1={macro_f1:.2f}%")
 
             # Save training logs with validation metrics
             with open(log_path, "a") as the_file:
-                the_file.write(f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f}, val_acc={val_accuracy:.2f}%\n")
+                the_file.write(f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f}, exact_match={exact_match:.2f}%, macro_f1={macro_f1:.2f}%\n")
                 time_mins = epoch_time / 60
                 the_file.write(f"Epoch {epoch+1}/{epochs}, needed {time_mins:.2f} minutes\n")
 
@@ -274,28 +282,21 @@ def resolve_path(paths, default, writable=False):
 
 
 def setup_dataloaders(config, transform):
-    """Build train and optional validation DataLoaders from config."""
+    """Build train and validation DataLoaders from config using ChestXrayDataset."""
     data_config = config.get("data", {})
-    root_path = resolve_path(data_config.get("root", "data/Dataset"), "data/Dataset")
-    full_dataset = datasets.ImageFolder(root=root_path, transform=transform)
+    dl_config = config.get("dataloader", {})
 
-    batch_size = data_config.get("batch_size", 32)
-    val_split = data_config.get("val_split", 0.2)
-
-    if val_split > 0:
-        val_size = int(len(full_dataset) * val_split)
-        train_size = len(full_dataset) - val_size
-        generator = torch.Generator().manual_seed(42)
-        trainset, valset = random_split(full_dataset, [train_size, val_size], generator=generator)
-        print(f"Dataset split: {train_size} training, {val_size} validation samples")
-        valloader = DataLoader(valset, batch_size=batch_size, shuffle=False)
-    else:
-        trainset = full_dataset
-        valloader = None
-        print(f"No validation split. Using all {len(trainset)} samples for training.")
-
-    trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=data_config.get("shuffle", True))
-    return trainloader, valloader
+    train_loader, val_loader, _ = get_dataloaders(
+        data_path=data_config.get("image_dir", "data/sample/images"),
+        label_path=data_config.get("labels_csv", "data/sample_labels.csv"),
+        batch_size=dl_config.get("batch_size", 32),
+        val_split=dl_config.get("val_split", 0.2),
+        test_split=dl_config.get("test_split", 0.1),
+        seed=dl_config.get("seed", 42),
+        num_workers=dl_config.get("num_workers", 0),
+        transform=transform,
+    )
+    return train_loader, val_loader
 
 
 def setup_optimizer(model, train_config):
@@ -314,6 +315,12 @@ def setup_optimizer(model, train_config):
     raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
 
+def setup_criterion(config: dict, train_loader=None) -> nn.Module:
+    """Instantiate loss function from config. Falls back to AsymmetricLoss if not specified."""
+    loss_config = config.get("loss", {"name": "asymmetric"})
+    return build_loss(loss_config, train_loader=train_loader)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train model script")
     parser.add_argument("model", type=str, help="Model name to train")
@@ -328,7 +335,7 @@ def main():
         config = load_config(args.model)
 
     model = create_model(args.model, config)
-    trainloader, valloader = setup_dataloaders(config, get_transforms(config.get("transforms", {})))
+    trainloader, valloader = setup_dataloaders(config, get_transforms(config.get("transform", {})))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -344,7 +351,7 @@ def main():
         model=model,
         train_loader=trainloader,
         val_loader=valloader,
-        criterion=nn.CrossEntropyLoss(),
+        criterion=setup_criterion(config, train_loader=trainloader),
         optimizer=setup_optimizer(model, train_config),
         device=device,
         output_path=output_path,
