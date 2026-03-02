@@ -6,9 +6,18 @@ model_params:
   drop_rate: 0.0           # dropout inside Dense Layers (try 0.2 if overfitting)
   block_config: [6, 12, 24, 16]  # Dense Layers per block — defines DenseNet-121
 
+loss:
+  name: weighted_bce      # Paper loss: BCE with w+ = |N|/(|P|+|N|), w- = |P|/(|P|+|N|)
+  label_smoothing: 0.0    # pos_weight computed automatically from training data
+
 training:
   optimizer: Adam
-  learning_rate: 0.0001    # Lower LR than typical: DenseNet is already data-efficient
+  learning_rate: 0.001     # Initial LR from paper (Rajpurkar et al.)
   weight_decay: 0.0001     # L2 regularisation
   epochs: 50
   patience: 7
+  scheduler:
+    name: ReduceLROnPlateau
+    factor: 0.1            # Decay by ÷10 on plateau (paper)
+    patience: 1            # Reduce after 1 epoch of no val-loss improvement
+    min_lr: 0.000001

@@ -1,8 +1,28 @@
 data:
   labels_csv: "data/sample_labels.csv"
   image_dir: "data/sample/images"
+
+# Loss function config — switch `name` to change strategy.
+#
+# Options:
+#   asymmetric   — Asymmetric Loss (recommended for severe imbalance)
+#   weighted_bce — BCE with per-label pos_weight (simpler baseline)
+#
+loss:
+  name: asymmetric
+  gamma_neg: 4         # focusing strength for easy negatives (higher = more aggressive downweighting)
+  gamma_pos: 1         # focusing strength for hard positives (keep low to not penalise rare classes)
+  clip: 0.05           # shifts negative probs down by this margin before log
+  label_smoothing: 0.0 # set to 0.1 for noisy medical labels
+
+# Weighted BCE alternative (uncomment to use):
+# loss:
+#   name: weighted_bce
+#   label_smoothing: 0.0
+#   # pos_weight: [2.0, 5.0, 10.0, ...]  # optional: one float per label
+#   #   if omitted, weights are computed automatically from training data
 dataloader:
-  batch_size: 32
+  batch_size: 16
   val_split: 0.2
   test_split: 0.1
   seed: 42
@@ -32,3 +52,6 @@ model_registry:
   resnet:
     module_path: "models.ResNet"
     class_name: "ResNet"
+  densenet:
+    module_path: "models.DenseNet"
+    class_name: "DenseNet121"
