@@ -6,6 +6,10 @@ model_params:
   drop_rate: 0.0           # dropout inside Dense Layers (try 0.2 if overfitting)
   block_config: [6, 12, 24, 16]  # Dense Layers per block — defines DenseNet-121
 
+fine_tune:
+  pretrained: true       # load ImageNet backbone weights before training
+  freeze_backbone: false # set true to train the classifier head only first
+
 loss:
   name: weighted_bce      # Paper loss: BCE with w+ = |N|/(|P|+|N|), w- = |P|/(|P|+|N|)
   label_smoothing: 0.0    # pos_weight computed automatically from training data

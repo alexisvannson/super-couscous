@@ -296,6 +296,15 @@ def main():
         config = load_config(args.model)
 
     model = create_model(args.model, config)
+
+    fine_tune_cfg = config.get("fine_tune", {})
+    if fine_tune_cfg.get("pretrained", False):
+        model.load_imagenet_weights()
+    if fine_tune_cfg.get("freeze_backbone", False):
+        model.freeze_backbone()
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Backbone frozen — {trainable:,} trainable parameters (classifier head only)")
+
     trainloader, valloader = setup_dataloaders(config, get_transforms(config.get("transform", {})))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
