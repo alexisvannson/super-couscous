@@ -5,4 +5,5 @@ Pillow
 pandas
 tqdm
 pyyaml
+wandb
 numpy<2
