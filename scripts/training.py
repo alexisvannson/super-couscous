@@ -4,7 +4,10 @@ import sys
 import time
 from datetime import datetime
 
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import numpy as np
 import torch
 import torch.nn as nn
@@ -240,8 +243,12 @@ def train(
         avg_train_loss = epoch_loss / len(train_loader)
         epoch_time = time.time() - t0
 
+        monitor_loss = avg_train_loss
+        macro_f1 = 0.0
+
         if val_loader is not None:
             val_loss, exact_match, macro_f1, mean_auc, per_label_auc = validate(model, val_loader, criterion, device)
+            monitor_loss = val_loss
             if scheduler is not None:
                 scheduler.step(val_loss)
             log_line = (f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f},"
@@ -262,7 +269,6 @@ def train(
                     metrics[f"auc/{name}"] = auc * 100
                 wandb.log(metrics)
         else:
-            monitor_loss = avg_train_loss
             log_line = f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f}"
             if use_wandb:
                 wandb.log({"epoch": epoch + 1, "train_loss": avg_train_loss})
@@ -277,7 +283,7 @@ def train(
             patience_counter = 0
             best_model_path = os.path.join(output_path, f"best_model_epoch{epoch+1}.pth")
             torch.save(model.state_dict(), best_model_path)
-            print(f"Saved best model (loss={monitor_loss:.4f}): {best_model_path}")
+            print(f"Saved best model (monitor_loss={monitor_loss:.4f}): {best_model_path}")
         else:
             patience_counter += 1
 
@@ -403,15 +409,16 @@ def main():
 
     # Init W&B if available
     use_wandb = False
-    try:
-        wandb.init(project="chestxray", name=args.model, config=config)
-        use_wandb = True
-        print("W&B logging enabled.")
-    except Exception as e:
-        print(f"W&B not available, skipping: {e}")
+    if wandb is not None:
+        try:
+            wandb.init(project="chestxray", name=args.model, config=config)
+            use_wandb = True
+            print("W&B logging enabled.")
+        except Exception as e:
+            print(f"W&B not available, skipping: {e}")
 
     # Retrieve label names from dataloader dataset if available
-    label_names = getattr(trainloader.dataset, "label_columns", None)
+    label_names = getattr(trainloader.dataset, "labels", None)
 
     optimizer = setup_optimizer(model, train_config)
     train(
