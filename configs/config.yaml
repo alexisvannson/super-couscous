@@ -1,5 +1,5 @@
 data:
-  labels_csv: "data/sample_labels.csv"
+  labels_csv: "/content/dataset-xray/sample_labels.csv"
   image_dir: "data/sample/images"
 
 # Loss function config — switch `name` to change strategy.
@@ -30,28 +30,19 @@ dataloader:
 
 transform:
   image_size: 224
+  normalize: true
   normalize_mean: [0.485, 0.456, 0.406]
   normalize_std: [0.229, 0.224, 0.225]
-
+  augmentation:
+    horizontal_flip: true
+    rotation_degrees: 10
+    translate: [0.05, 0.05]       # fraction of image size (x, y)
+    brightness_jitter: 0.2
+    contrast_jitter: 0.2
 model_registry:
-  senet:
-    module_path: "models.SENET"
-    class_name: "SENet"
-  vit:
-    module_path: "models.VIT"
-    class_name: "VisionTransformerPretrained" # Pre-trained ViT from HuggingFace
-  vit-scratch:
-    module_path: "models.VIT"
-    class_name: "VisionTransformer" # Custom ViT from scratch
-  mlp:
-    module_path: "models.MLP"
-    class_name: "MLP"
   cnn:
     module_path: "models.CNN"
     class_name: "CNN"
-  resnet:
-    module_path: "models.ResNet"
-    class_name: "ResNet"
   densenet:
     module_path: "models.DenseNet"
     class_name: "DenseNet121"

@@ -37,11 +37,24 @@ class ChestXrayDataset(Dataset):
 
         if self.transform is not None:
             image = self.transform(image)
-        else:
-            image = transforms.ToTensor()(image)
-        
+
         label = torch.tensor([1 if value in row["Finding Labels"].split("|") else 0 for value in  self.labels], dtype=torch.bool)
         return image, label
+
+
+class TransformSubset(Dataset):
+    """Wraps a Subset and applies a transform, so train/val/test can have different augmentations."""
+    def __init__(self, subset, transform):
+        self.subset = subset
+        self.transform = transform
+        self.labels = subset.dataset.labels  # expose for downstream use
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        image, label = self.subset[idx]
+        return self.transform(image), label
 
 
 def split_data(full_dataset, seed, val_split, test_split):
@@ -78,22 +91,19 @@ def split_data(full_dataset, seed, val_split, test_split):
     return train_indices, val_indices, test_indices
 
 
-def get_dataloaders(data_path, label_path, batch_size=32, val_split=0.2, test_split=0.1, seed=42, num_workers=0, transform=None):
-    full_dataset = ChestXrayDataset(label_path, data_path, transform=transform)
+def get_dataloaders(data_path, label_path, batch_size=32, val_split=0.2, test_split=0.1, seed=42, num_workers=0, train_transform=None, eval_transform=None):
+    default_transform = transforms.ToTensor()
+    full_dataset = ChestXrayDataset(label_path, data_path)  # no transform — returns PIL images
 
     train_indices, val_indices, test_indices = split_data(full_dataset, seed, val_split, test_split)
 
-    # Now make Subsets
-    train_set = Subset(full_dataset, train_indices)
-    val_set = Subset(full_dataset, val_indices)
-    test_set = Subset(full_dataset, test_indices)
+    train_set = TransformSubset(Subset(full_dataset, train_indices), train_transform or default_transform)
+    val_set   = TransformSubset(Subset(full_dataset, val_indices),   eval_transform  or default_transform)
+    test_set  = TransformSubset(Subset(full_dataset, test_indices),  eval_transform  or default_transform)
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,  num_workers=num_workers)
+    val_loader   = DataLoader(val_set,   batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    test_loader  = DataLoader(test_set,  batch_size=batch_size, shuffle=False, num_workers=num_workers)
     return train_loader, val_loader, test_loader
 
 

@@ -19,25 +19,22 @@ import torch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from scripts.thedataloader import get_dataloaders
-from scripts.training import create_model, load_config, get_transforms
+from scripts.training import create_model, load_config, get_transforms, tune_thresholds
 
 
-# ── Inference ────────────────────────────────────────────────────────────────
-
-def collect_predictions(model, loader, device, threshold=0.5):
+def collect_predictions(model, loader, device, thresholds=0.5):
     """Return (preds, targets) as numpy arrays of shape (N, C)."""
     model.eval()
-    all_preds, all_targets = [], []
+    all_probs, all_targets = [], []
     with torch.no_grad():
         for images, labels in loader:
-            logits = model(images.to(device))
-            preds = (torch.sigmoid(logits) >= threshold).float()
-            all_preds.append(preds.cpu().numpy())
+            probs = torch.sigmoid(model(images.to(device))).cpu().numpy()
+            all_probs.append(probs)
             all_targets.append(labels.float().numpy())
-    return np.concatenate(all_preds), np.concatenate(all_targets)
-
-
-# ── Metrics ──────────────────────────────────────────────────────────────────
+    probs   = np.concatenate(all_probs)
+    targets = np.concatenate(all_targets)
+    preds   = (probs >= thresholds).astype(float)
+    return preds, targets
 
 def f1_per_label(preds: np.ndarray, targets: np.ndarray) -> np.ndarray:
     """Per-label F1 scores, shape (C,)."""
@@ -49,9 +46,6 @@ def f1_per_label(preds: np.ndarray, targets: np.ndarray) -> np.ndarray:
 
 def macro_f1(preds: np.ndarray, targets: np.ndarray) -> float:
     return float(f1_per_label(preds, targets).mean())
-
-
-# ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 def bootstrap_ci(preds: np.ndarray, targets: np.ndarray,
                  metric_fn, n: int = 1000, alpha: float = 0.05,
@@ -93,27 +87,22 @@ def bootstrap_ci_per_label(preds: np.ndarray, targets: np.ndarray,
     return f1_per_label(preds, targets), lo, hi
 
 
-# ── Report ───────────────────────────────────────────────────────────────────
-
 def print_report(point, lo, hi, per_label_point, per_label_lo, per_label_hi, label_names):
     w = max(len(l) for l in label_names) + 2
-    print("\n" + "=" * 60)
     print(f"  Macro F1: {point:.3f}  (95% CI {lo:.3f} – {hi:.3f})")
-    print("=" * 60)
     print(f"  {'Label':<{w}}  {'F1':>6}   {'95% CI':>18}")
     print(f"  {'-'*w}  {'------':>6}   {'------------------':>18}")
     for name, p, l, h in zip(label_names, per_label_point, per_label_lo, per_label_hi):
         print(f"  {name:<{w}}  {p:.3f}   ({l:.3f} – {h:.3f})")
-    print("=" * 60 + "\n")
 
-
-# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate model with bootstrap CI")
     parser.add_argument("model", type=str, help="Model name (must match configs/)")
     parser.add_argument("--weights", type=str, required=True, help="Path to .pth checkpoint")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Decision threshold")
+    parser.add_argument("--threshold", type=float, default=None, help="Fixed threshold (overrides tuned thresholds)")
+    parser.add_argument("--thresholds", type=str, default=None, help="Path to .npy file with per-label thresholds")
+    parser.add_argument("--tune", action="store_true", help="Tune thresholds on val set before evaluating")
     parser.add_argument("--n-bootstrap", type=int, default=1000, help="Bootstrap iterations")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -130,7 +119,8 @@ def main():
 
     data_cfg = config.get("data", {})
     dl_cfg   = config.get("dataloader", {})
-    _, _, test_loader = get_dataloaders(
+    eval_transform = get_transforms(config.get("transform", {}))
+    _, val_loader, test_loader = get_dataloaders(
         data_path=data_cfg.get("image_dir", "data/sample/images"),
         label_path=data_cfg.get("labels_csv", "data/sample_labels.csv"),
         batch_size=dl_cfg.get("batch_size", 32),
@@ -138,13 +128,29 @@ def main():
         test_split=dl_cfg.get("test_split", 0.1),
         seed=dl_cfg.get("seed", 42),
         num_workers=dl_cfg.get("num_workers", 0),
-        transform=get_transforms(config.get("transform", {})),
+        eval_transform=eval_transform,
     )
 
-    label_names = test_loader.dataset.dataset.labels
+    label_names = test_loader.dataset.labels
+
+    # Resolve thresholds: CLI flag > saved .npy > tune on val > default 0.5
+    if args.threshold is not None:
+        thresholds = args.threshold
+        print(f"Using fixed threshold: {thresholds}")
+    elif args.thresholds:
+        thresholds = np.load(args.thresholds)
+        print(f"Loaded thresholds from {args.thresholds}")
+    elif args.tune:
+        print("Tuning thresholds on validation set...")
+        thresholds = tune_thresholds(model, val_loader, device)
+        for name, t in zip(label_names, thresholds):
+            print(f"  {name}: {t:.2f}")
+    else:
+        thresholds = 0.5
+        print("Using default threshold: 0.5")
 
     print(f"Running inference on {len(test_loader.dataset)} test samples…")
-    preds, targets = collect_predictions(model, test_loader, device, args.threshold)
+    preds, targets = collect_predictions(model, test_loader, device, thresholds)
 
     print(f"Computing bootstrap CIs (n={args.n_bootstrap})…")
     point, lo, hi = bootstrap_ci(

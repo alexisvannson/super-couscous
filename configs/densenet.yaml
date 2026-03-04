@@ -1,9 +1,9 @@
 model_params:
-  num_classes: 15          # 14 ChestX-ray pathologies + "No Finding"
-  in_channels: 3           # RGB images
-  growth_rate: 32          # k: new feature maps per Dense Layer (paper default)
-  compression: 0.5         # theta: transition layers halve the channel count
-  drop_rate: 0.0           # dropout inside Dense Layers (try 0.2 if overfitting)
+  num_classes: 15 
+  in_channels: 3
+  growth_rate: 32          
+  compression: 0.5        
+  drop_rate: 0.2          
   block_config: [6, 12, 24, 16]  # Dense Layers per block — defines DenseNet-121
 
 fine_tune:
@@ -16,12 +16,12 @@ loss:
 
 training:
   optimizer: Adam
-  learning_rate: 0.001     # Initial LR from paper (Rajpurkar et al.)
-  weight_decay: 0.0001     # L2 regularisation
-  epochs: 50
-  patience: 7
+  learning_rate: 0.0001 
+  weight_decay: 0.0001     
+  epochs: 100
+  patience: 10
   scheduler:
     name: ReduceLROnPlateau
     factor: 0.1            # Decay by ÷10 on plateau (paper)
-    patience: 1            # Reduce after 1 epoch of no val-loss improvement
+    patience: 5            # Reduce after 5 epochs of no val-loss improvement
     min_lr: 0.000001

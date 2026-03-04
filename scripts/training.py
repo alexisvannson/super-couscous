@@ -4,10 +4,13 @@ import sys
 import time
 from datetime import datetime
 
+import wandb
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import yaml
+from sklearn.metrics import roc_auc_score
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -54,37 +57,84 @@ def create_model(model_name, config):
 
 
 def get_transforms(config):
-    """Create transforms based on config."""
-    transform_list = []
-
-    if "image_size" in config:
-        transform_list.append(transforms.Resize((config["image_size"], config["image_size"])))
-
-    transform_list.append(transforms.ToTensor())
-
-    if "normalize" in config and config["normalize"]:
-        transform_list.append(
-            transforms.Normalize(
-                mean=config.get("mean", [0.485, 0.456, 0.406]),
-                std=config.get("std", [0.229, 0.224, 0.225]),
-            )
-        )
-
-    return transforms.Compose(transform_list)
+    """Eval/val/test transform — no augmentation."""
+    size = config.get("image_size", 224)
+    t = [transforms.Resize((size, size)), transforms.ToTensor()]
+    if config.get("normalize"):
+        t.append(transforms.Normalize(
+            mean=config.get("normalize_mean", [0.485, 0.456, 0.406]),
+            std=config.get("normalize_std",  [0.229, 0.224, 0.225]),
+        ))
+    return transforms.Compose(t)
 
 
-def validate(model, val_loader, criterion, device, threshold=0.5):
+def get_train_transform(config):
+    """Train transform — includes augmentations from config."""
+    size = config.get("image_size", 224)
+    aug  = config.get("augmentation", {})
+    t = [transforms.Resize((size, size))]
+    if aug.get("horizontal_flip"):
+        t.append(transforms.RandomHorizontalFlip())
+    if aug.get("rotation_degrees", 0):
+        t.append(transforms.RandomRotation(aug["rotation_degrees"]))
+    if aug.get("translate"):
+        t.append(transforms.RandomAffine(degrees=0, translate=tuple(aug["translate"])))
+    if aug.get("brightness_jitter", 0) or aug.get("contrast_jitter", 0):
+        t.append(transforms.ColorJitter(
+            brightness=aug.get("brightness_jitter", 0),
+            contrast=aug.get("contrast_jitter", 0),
+        ))
+    t.append(transforms.ToTensor())
+    if config.get("normalize"):
+        t.append(transforms.Normalize(
+            mean=config.get("normalize_mean", [0.485, 0.456, 0.406]),
+            std=config.get("normalize_std",  [0.229, 0.224, 0.225]),
+        ))
+    return transforms.Compose(t)
+
+
+def tune_thresholds(model, val_loader, device):
+    """Find per-label thresholds maximising F1 on the validation set."""
+    model.eval()
+    all_probs, all_targets = [], []
+    with torch.no_grad():
+        for images, labels in val_loader:
+            probs = torch.sigmoid(model(images.to(device))).cpu().numpy()
+            all_probs.append(probs)
+            all_targets.append(labels.float().numpy())
+
+    probs   = np.concatenate(all_probs)    # (N, C)
+    targets = np.concatenate(all_targets)  # (N, C)
+
+    best_thresholds = np.full(probs.shape[1], 0.5)
+    for c in range(probs.shape[1]):
+        best_f1, best_t = -1.0, 0.5
+        for t in np.arange(0.1, 0.91, 0.05):
+            preds = (probs[:, c] >= t).astype(float)
+            tp = (preds * targets[:, c]).sum()
+            fp = (preds * (1 - targets[:, c])).sum()
+            fn = ((1 - preds) * targets[:, c]).sum()
+            f1 = 2 * tp / (2 * tp + fp + fn + 1e-8)
+            if f1 > best_f1:
+                best_f1, best_t = f1, t
+        best_thresholds[c] = best_t
+    return best_thresholds
+
+
+def validate(model, val_loader, criterion, device, threshold=0.5, thresholds=None):
     """
     Validate the model on validation set.
 
     Returns:
-        tuple: (avg_loss, exact_match_accuracy, macro_f1)
+        tuple: (avg_loss, exact_match_accuracy, macro_f1, mean_auc, per_label_auc)
             - exact_match_accuracy: % of samples where ALL labels are correct
             - macro_f1: average F1 across all labels
+            - mean_auc: average AUC-ROC across all labels
+            - per_label_auc: dict {label_index: auc_value}
     """
     model.eval()
     val_loss = 0
-    all_preds = []
+    all_probs = []
     all_targets = []
 
     with torch.no_grad():
@@ -95,14 +145,19 @@ def validate(model, val_loader, criterion, device, threshold=0.5):
             logits = model(sample)
             val_loss += criterion(logits, label).item()
 
-            preds = (torch.sigmoid(logits) >= threshold).float()
-            all_preds.append(preds.cpu())
+            probs = torch.sigmoid(logits)
+            all_probs.append(probs.cpu())
             all_targets.append(label.cpu())
 
     avg_loss = val_loss / len(val_loader)
 
-    preds_cat = torch.cat(all_preds)     # (N, C)
-    targets_cat = torch.cat(all_targets) # (N, C)
+    probs_cat = torch.cat(all_probs).numpy()   # (N, C)
+    targets_cat = torch.cat(all_targets)       # (N, C)
+
+    # Apply per-label or scalar threshold
+    t = thresholds if thresholds is not None else threshold
+    preds_cat = torch.tensor((probs_cat >= t).astype(float))  # (N, C)
+    targets_np = targets_cat.numpy()
 
     # Exact match accuracy (all labels must match)
     exact_match = (preds_cat == targets_cat).all(dim=1).float().mean().item() * 100
@@ -113,7 +168,18 @@ def validate(model, val_loader, criterion, device, threshold=0.5):
     fn = ((1 - preds_cat) * targets_cat).sum(dim=0)
     macro_f1 = (2 * tp / (2 * tp + fp + fn + 1e-8)).mean().item() * 100
 
-    return avg_loss, exact_match, macro_f1
+    # Per-label AUC-ROC (skip labels with only one class present in val set)
+    per_label_auc = {}
+    auc_values = []
+    for i in range(probs_cat.shape[1]):
+        if len(set(targets_np[:, i])) < 2:
+            continue
+        auc = roc_auc_score(targets_np[:, i], probs_cat[:, i])
+        per_label_auc[i] = auc
+        auc_values.append(auc)
+    mean_auc = float(np.mean(auc_values)) * 100 if auc_values else 0.0
+
+    return avg_loss, exact_match, macro_f1, mean_auc, per_label_auc
 
 
 def train(
@@ -129,8 +195,10 @@ def train(
     output_path="weights",
     weights_name="final_model",
     start_weights=None,
+    use_wandb=False,
+    label_names=None,
 ):
-    best_loss = float("inf")
+    best_score = - float("inf")
     patience_counter = 0
 
     if start_weights:
@@ -173,23 +241,39 @@ def train(
         epoch_time = time.time() - t0
 
         if val_loader is not None:
-            val_loss, exact_match, macro_f1 = validate(model, val_loader, criterion, device)
+            val_loss, exact_match, macro_f1, mean_auc, per_label_auc = validate(model, val_loader, criterion, device)
             if scheduler is not None:
                 scheduler.step(val_loss)
-            monitor_loss = val_loss
             log_line = (f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f},"
-                        f" val_loss={val_loss:.4f}, exact_match={exact_match:.2f}%, macro_f1={macro_f1:.2f}%")
+                        f" val_loss={val_loss:.4f}, exact_match={exact_match:.2f}%,"
+                        f" macro_f1={macro_f1:.2f}%, mean_auc={mean_auc:.2f}%")
+
+            if use_wandb:
+                metrics = {
+                    "epoch": epoch + 1,
+                    "train_loss": avg_train_loss,
+                    "val_loss": val_loss,
+                    "exact_match": exact_match,
+                    "macro_f1": macro_f1,
+                    "mean_auc": mean_auc,
+                }
+                for i, auc in per_label_auc.items():
+                    name = label_names[i] if label_names and i < len(label_names) else f"label_{i}"
+                    metrics[f"auc/{name}"] = auc * 100
+                wandb.log(metrics)
         else:
             monitor_loss = avg_train_loss
             log_line = f"Epoch {epoch+1}/{epochs}, train_loss={avg_train_loss:.4f}"
+            if use_wandb:
+                wandb.log({"epoch": epoch + 1, "train_loss": avg_train_loss})
 
         print(log_line)
         with open(log_path, "a") as f:
             f.write(log_line + "\n")
             f.write(f"Epoch {epoch+1}/{epochs}, needed {epoch_time / 60:.2f} minutes\n")
 
-        if monitor_loss < best_loss:
-            best_loss = monitor_loss
+        if macro_f1 > best_score:
+            best_score = macro_f1
             patience_counter = 0
             best_model_path = os.path.join(output_path, f"best_model_epoch{epoch+1}.pth")
             torch.save(model.state_dict(), best_model_path)
@@ -210,7 +294,7 @@ def train(
     with open(log_path, "a") as f:
         f.write("-" * 50 + "\n")
         f.write(f"Training completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Best loss achieved: {best_loss:.4f}\n")
+        f.write(f"Best macro_f1 achieved: {best_score:.4f}\n")
         f.write(f"Final model saved: {final_model_path}\n")
 
 
@@ -225,10 +309,11 @@ def resolve_path(paths, writable=False):
     return paths[0]
 
 
-def setup_dataloaders(config, transform):
+def setup_dataloaders(config):
     """Build train and validation DataLoaders from config using ChestXrayDataset."""
     data_config = config.get("data", {})
     dl_config = config.get("dataloader", {})
+    transform_config = config.get("transform", {})
 
     train_loader, val_loader, _ = get_dataloaders(
         data_path=data_config.get("image_dir", "data/sample/images"),
@@ -238,7 +323,8 @@ def setup_dataloaders(config, transform):
         test_split=dl_config.get("test_split", 0.1),
         seed=dl_config.get("seed", 42),
         num_workers=dl_config.get("num_workers", 0),
-        transform=transform,
+        train_transform=get_train_transform(transform_config),
+        eval_transform=get_transforms(transform_config),
     )
     return train_loader, val_loader
 
@@ -305,7 +391,7 @@ def main():
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Backbone frozen — {trainable:,} trainable parameters (classifier head only)")
 
-    trainloader, valloader = setup_dataloaders(config, get_transforms(config.get("transform", {})))
+    trainloader, valloader = setup_dataloaders(config)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -314,6 +400,18 @@ def main():
     train_config = config.get("training", {})
     out_path_cfg = train_config.get("output_paths") or train_config.get("output_path", "models/checkpoints")
     output_path = resolve_path(out_path_cfg, writable=True)
+
+    # Init W&B if available
+    use_wandb = False
+    try:
+        wandb.init(project="chestxray", name=args.model, config=config)
+        use_wandb = True
+        print("W&B logging enabled.")
+    except Exception as e:
+        print(f"W&B not available, skipping: {e}")
+
+    # Retrieve label names from dataloader dataset if available
+    label_names = getattr(trainloader.dataset, "label_columns", None)
 
     optimizer = setup_optimizer(model, train_config)
     train(
@@ -329,8 +427,21 @@ def main():
         epochs=train_config.get("epochs", 20),
         patience=train_config.get("patience", 5),
         start_weights=args.weights,
+        use_wandb=use_wandb,
+        label_names=label_names,
     )
 
+    print("Tuning per-label thresholds on validation set...")
+    best_thresholds = tune_thresholds(model, valloader, device)
+    threshold_path = os.path.join(output_path, f"{args.model}_thresholds.npy")
+    np.save(threshold_path, best_thresholds)
+    label_names_list = getattr(trainloader.dataset, "labels", [f"label_{i}" for i in range(len(best_thresholds))])
+    for name, t in zip(label_names_list, best_thresholds):
+        print(f"  {name}: {t:.2f}")
+    print(f"Thresholds saved to {threshold_path}")
+
+    if use_wandb:
+        wandb.finish()
 
 if __name__ == "__main__":
     main()
